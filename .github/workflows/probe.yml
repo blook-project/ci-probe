@@ -1,0 +1,82 @@
+name: wdk-probe
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    name: WDK/SDK inventory
+    runs-on: windows-latest
+    steps:
+      - name: Runner + WDK inventory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $os = Get-CimInstance Win32_OperatingSystem
+          "OS: $($os.Caption) / $($os.Version) / build $($os.BuildNumber)"
+          "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion"
+          "WDKContentRoot=$env:WDKContentRoot"
+          "WindowsSdkDir=$env:WindowsSdkDir WindowsSdkVersion=$env:WindowsSdkVersion"
+          "KITROOT=$env:KITROOT"
+
+          foreach ($r in @('C:\Program Files (x86)\Windows Kits\10', 'C:\Program Files (x86)\Windows Kits\11')) {
+            "== KITS_ROOT $r exists=$(Test-Path -LiteralPath $r)"
+            if (Test-Path -LiteralPath $r) {
+              "   Lib: " + ((Get-ChildItem -LiteralPath "$r\Lib" -Directory -EA 0).Name -join ', ')
+              "   Include: " + ((Get-ChildItem -LiteralPath "$r\Include" -Directory -EA 0).Name -join ', ')
+              foreach ($d in (Get-ChildItem -LiteralPath "$r\Lib" -Directory -EA 0)) {
+                "   km lib [$($d.Name)] = $(Test-Path -LiteralPath "$($d.FullName)\km")"
+              }
+            }
+          }
+
+          "== Visual Studio =="
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            & $vswhere -latest -products * -property installationPath
+            & $vswhere -latest -products * -property catalog_productDisplayVersion
+            & $vswhere -latest -products * -property installationVersion
+          } else { "vswhere MISSING" }
+          if (Test-Path 'C:\Program Files\Microsoft Visual Studio') {
+            "VS dirs: " + ((Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Directory -EA 0).Name -join ', ')
+          }
+
+          "== winget / choco =="
+          if (Get-Command winget -EA 0) { "winget present: $(( winget --version ) 2>&1)" } else { "winget MISSING" }
+          if (Get-Command choco -EA 0) { "choco present: $((choco --version) 2>&1)" } else { "choco MISSING" }
+          if (Get-Command choco -EA 0) { "choco wdk-ish pkgs:"; choco list --local-only 2>&1 | Select-String -Pattern 'sdk|wdk|driver' }
+
+  wdk-build:
+    name: xmake WDK driver build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+
+      - name: xmake version
+        shell: pwsh
+        run: xmake --version
+
+      - name: Build minimal WDM driver against preinstalled WDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $wdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
+          $km = @(Get-ChildItem -LiteralPath "$wdkRoot\Lib" -Directory -EA 0 | Where-Object { Test-Path -LiteralPath "$($_.FullName)\km" })
+          if ($km.Count -eq 0) {
+            Write-Host "::error::No WDK km libs under $wdkRoot\Lib\*\km"
+            exit 1
+          }
+          $km | ForEach-Object { "km lib found: $($_.FullName) (files=$((Get-ChildItem $_.FullName -File | Measure-Object).Count))" }
+          Push-Location probe
+          xmake f -c -y -m release --wdk="$wdkRoot"
+          xmake -y
+          $sys = Get-ChildItem build -Recurse -Filter *.sys -EA 0
+          if (-not $sys) { Write-Host "::error::no .sys produced"; exit 1 }
+          $sys | ForEach-Object { "PRODUCED: $($_.FullName) size=$($_.Length)" }
